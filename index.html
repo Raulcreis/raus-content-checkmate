@@ -78,6 +78,21 @@ input[type=checkbox] { width:16px; height:16px; cursor:pointer; accent-color:var
   .metric-val { font-size:18px; }
   .dist-row { flex-direction:column; }
 }
+.notif-toggle { background:var(--card); color:var(--yellow); border:1px solid var(--border); padding:6px 10px; border-radius:4px; cursor:pointer; font-size:13px; font-family:inherit; transition:all 0.15s; margin-left:4px; }
+.notif-toggle.active { color:var(--green); border-color:var(--green); }
+.notif-panel { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:20px; margin-bottom:16px; display:none; }
+.notif-panel.show { display:block; }
+.notif-panel h3 { margin:0 0 6px; font-size:14px; color:var(--text); font-weight:700; }
+.notif-panel .notif-sub { font-size:11px; color:var(--dim); margin-bottom:16px; }
+.notif-slot { display:flex; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid var(--border)22; }
+.notif-slot:last-child { border-bottom:none; }
+.notif-slot label { font-size:12px; color:var(--dim); min-width:70px; }
+.notif-slot input[type=time] { background:var(--row); border:1px solid var(--border); color:var(--text); padding:6px 10px; border-radius:4px; font-size:13px; font-family:inherit; }
+.notif-slot .slot-enabled { accent-color:var(--green); }
+.notif-perm-btn { background:var(--yellow); color:#000; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:700; font-family:inherit; margin-bottom:12px; }
+.notif-perm-btn.granted { background:var(--green); }
+.notif-perm-btn.denied { background:var(--accent); color:#fff; cursor:default; }
+.notif-status { font-size:11px; color:var(--dim); margin-left:12px; }
 </style>
 </head>
 <body>
@@ -110,6 +125,7 @@ input[type=checkbox] { width:16px; height:16px; cursor:pointer; accent-color:var
 <div class="metrics" id="metrics"></div>
 <div class="tabs" id="tabs"></div>
 <div class="handle-bar" id="handleBar"></div>
+<div class="notif-panel" id="notifPanel"></div>
 <div class="progress-bar" id="progressBar"></div>
 <div class="table-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table><div class="pagination" id="pagination"></div></div>
 <div class="dist" id="distPanel"></div>
@@ -130,6 +146,7 @@ const db = firebase.database();
 const uploadedRef = db.ref("uploaded");
 const handlesRef = db.ref("handles");
 const settingsRef = db.ref("settings");
+const notifRef = db.ref("notifications");
 
 // ── Constants & Data ────────────────────────────────────────────────
 const SEGMENTS=["Hook","Verse 1","Verse 2","Verse 3","Verse 4"];
@@ -154,6 +171,9 @@ let state = {
   editingHandle: null,
   inventory: [], schedule: [], metrics: {}, accountVideos: [],
   firebaseReady: false,
+  showNotifPanel: false,
+  notifSchedules: {},  // { accountNum: { enabled: bool, times: ["13:00","15:00",...] } }
+  notifPermission: typeof Notification !== "undefined" ? Notification.permission : "denied",
 };
 
 // ── Firebase Sync ───────────────────────────────────────────────────
@@ -233,6 +253,83 @@ function saveUploaded(fileId, isUploaded) {
 function saveHandles() {
   handlesRef.set(state.handles);
   localStorage.setItem("rau_handles", JSON.stringify(state.handles));
+}
+
+// Listen for real-time changes to notification schedules
+notifRef.on("value", (snapshot) => {
+  state.notifSchedules = snapshot.val() || {};
+  // Reschedule local timers based on latest data
+  scheduleNotifTimers();
+  render();
+}, (err) => {
+  console.error("Firebase notifications error:", err);
+  state.notifSchedules = JSON.parse(localStorage.getItem("rau_notifs") || "{}");
+});
+
+function saveNotifSchedules() {
+  notifRef.set(state.notifSchedules);
+  localStorage.setItem("rau_notifs", JSON.stringify(state.notifSchedules));
+  scheduleNotifTimers();
+}
+
+// ── Notification Timer System ───────────────────────────────────────
+let notifTimers = []; // active setTimeout IDs
+
+function scheduleNotifTimers() {
+  // Clear existing timers
+  notifTimers.forEach(t => clearTimeout(t));
+  notifTimers = [];
+
+  if (state.notifPermission !== "granted") return;
+
+  const now = new Date();
+  for (const [acctStr, config] of Object.entries(state.notifSchedules)) {
+    if (!config || !config.enabled || !config.times) continue;
+    const acct = parseInt(acctStr);
+    const label = state.handles[acct] ? `Acct ${acct} | ${state.handles[acct]}` : `Account ${acct}`;
+
+    config.times.forEach((timeStr, idx) => {
+      if (!timeStr) return;
+      const [h, m] = timeStr.split(":").map(Number);
+      const target = new Date(now);
+      target.setHours(h, m, 0, 0);
+
+      // If time already passed today, schedule for tomorrow
+      if (target <= now) target.setDate(target.getDate() + 1);
+
+      const delay = target - now;
+      if (delay > 0 && delay < 86400000) { // Within 24h
+        const timer = setTimeout(() => {
+          fireNotification(label, idx + 1);
+          // Re-schedule for tomorrow
+          scheduleNotifTimers();
+        }, delay);
+        notifTimers.push(timer);
+      }
+    });
+  }
+}
+
+function fireNotification(accountLabel, postNum) {
+  if (Notification.permission === "granted") {
+    new Notification("RAU's Content Extravaganza", {
+      body: `Time to upload Post #${postNum} for ${accountLabel}!`,
+      icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▶</text></svg>",
+      tag: `rau-post-${accountLabel}-${postNum}`,
+      requireInteraction: true,
+    });
+  }
+}
+
+async function requestNotifPermission() {
+  if (typeof Notification === "undefined") {
+    alert("This browser doesn't support notifications. Try Chrome or Firefox.");
+    return;
+  }
+  const result = await Notification.requestPermission();
+  state.notifPermission = result;
+  if (result === "granted") scheduleNotifTimers();
+  render();
 }
 
 // ── Inventory ───────────────────────────────────────────────────────
@@ -395,15 +492,78 @@ function render(){
     hb.innerHTML=`<span style="font-size:11px;color:var(--dim)">Handle for Acct ${s.activeAccount}:</span>
       <input type="text" id="handleInput" value="${s.handles[s.activeAccount]||""}" placeholder="@handle">
       <button class="btn-sm" style="background:var(--green);color:#fff;border:none" id="saveHandleBtn">Save</button>
-      <button class="btn-sm" style="background:transparent;color:var(--dim);border:1px solid var(--border)" id="cancelHandleBtn">Cancel</button>`;
+      <button class="btn-sm" style="background:transparent;color:var(--dim);border:1px solid var(--border)" id="cancelHandleBtn">Cancel</button>
+      <button class="notif-toggle${s.showNotifPanel?" active":""}" id="notifToggleBtnEdit" title="Notification settings">🔔</button>`;
     document.getElementById("handleInput").focus();
     document.getElementById("handleInput").onkeydown=e=>{if(e.key==="Enter")doSaveHandle();if(e.key==="Escape"){s.editingHandle=null;render();}};
     document.getElementById("saveHandleBtn").onclick=doSaveHandle;
     document.getElementById("cancelHandleBtn").onclick=()=>{s.editingHandle=null;render();};
+    document.getElementById("notifToggleBtnEdit").onclick=()=>{s.showNotifPanel=!s.showNotifPanel;render();};
   } else {
     const hl=s.handles[s.activeAccount];
-    hb.innerHTML=`<button class="btn-sm" style="background:transparent;color:var(--dim);border:1px solid var(--border)" id="editHandleBtn">${hl?`✎ Edit handle (${hl})`:"✎ Set @handle"}</button>`;
+    hb.innerHTML=`<button class="btn-sm" style="background:transparent;color:var(--dim);border:1px solid var(--border)" id="editHandleBtn">${hl?`✎ Edit handle (${hl})`:"✎ Set @handle"}</button>
+    <button class="notif-toggle${s.showNotifPanel?" active":""}" id="notifToggleBtn" title="Notification settings">🔔</button>`;
     document.getElementById("editHandleBtn").onclick=()=>{s.editingHandle=s.activeAccount;render();};
+    document.getElementById("notifToggleBtn").onclick=()=>{s.showNotifPanel=!s.showNotifPanel;render();};
+  }
+
+  // Notification panel
+  const np=document.getElementById("notifPanel");
+  if(s.showNotifPanel){
+    np.classList.add("show");
+    const acct=s.activeAccount;
+    const config=s.notifSchedules[acct]||{enabled:false,times:[]};
+    const ppd=s.postsPerDay;
+    // Ensure times array matches postsPerDay length
+    while(config.times.length<ppd) config.times.push("");
+    if(config.times.length>ppd) config.times=config.times.slice(0,ppd);
+
+    const permText = s.notifPermission==="granted"?"Notifications enabled ✓"
+      : s.notifPermission==="denied"?"Notifications blocked by browser"
+      : "Allow notifications";
+    const permClass = s.notifPermission==="granted"?"granted":s.notifPermission==="denied"?"denied":"";
+    const permDisabled = s.notifPermission==="denied"?"disabled":"";
+
+    let slotsHtml="";
+    for(let i=0;i<ppd;i++){
+      slotsHtml+=`<div class="notif-slot">
+        <label>Post ${i+1}</label>
+        <input type="time" class="notif-time" data-slot="${i}" value="${config.times[i]||""}">
+      </div>`;
+    }
+
+    np.innerHTML=`
+      <h3>🔔 Notification Schedule — ${acctLabel(acct)}</h3>
+      <p class="notif-sub">${ppd} posts per day · Set a time for each post to receive a reminder</p>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+        <button class="notif-perm-btn ${permClass}" id="notifPermBtn" ${permDisabled}>${permText}</button>
+        <label style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:6px">
+          <input type="checkbox" class="slot-enabled" id="notifEnabledCb" ${config.enabled?"checked":""} style="accent-color:var(--green)"> Active for this account
+        </label>
+      </div>
+      <div id="notifSlots">${slotsHtml}</div>
+      <p style="margin-top:12px;font-size:10px;color:var(--dim)">
+        ${s.notifPermission==="denied"?"⚠ You blocked notifications. Reset in browser settings (Site Settings → Notifications).":"Keep this tab open or add to Home Screen (iOS) for notifications to fire."}
+      </p>`;
+
+    document.getElementById("notifPermBtn").onclick=()=>{ if(s.notifPermission!=="denied") requestNotifPermission(); };
+    document.getElementById("notifEnabledCb").onchange=(e)=>{
+      if(!s.notifSchedules[acct]) s.notifSchedules[acct]={enabled:false,times:[]};
+      s.notifSchedules[acct].enabled=e.target.checked;
+      saveNotifSchedules();
+    };
+    document.querySelectorAll(".notif-time").forEach(inp=>{
+      inp.onchange=()=>{
+        const slot=parseInt(inp.dataset.slot);
+        if(!s.notifSchedules[acct]) s.notifSchedules[acct]={enabled:false,times:[]};
+        while(s.notifSchedules[acct].times.length<=slot) s.notifSchedules[acct].times.push("");
+        s.notifSchedules[acct].times[slot]=inp.value;
+        saveNotifSchedules();
+      };
+    });
+  } else {
+    np.classList.remove("show");
+    np.innerHTML="";
   }
 
   // Progress bar
